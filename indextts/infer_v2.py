@@ -38,7 +38,7 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False
+            use_cuda_kernel=None, use_deepspeed=False, compile_gpt=False, attn_impl=None
     ):
         """
         Args:
@@ -96,6 +96,42 @@ class IndexTTS2:
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
 
         self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_fp16)
+
+        # Try to select SDPA attention for GPT if requested and supported
+        if attn_impl == "sdpa":
+            try:
+                # Prefer SDPA kernels (flash or mem_efficient) over math backend
+                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                    try:
+                        torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+                    except Exception:
+                        pass
+                # Set HuggingFace GPT2 config to use SDPA path when available
+                if hasattr(self.gpt, "gpt") and hasattr(self.gpt.gpt, "config"):
+                    # Many HF configs use internal `_attn_implementation`; set both just in case
+                    setattr(self.gpt.gpt.config, "_attn_implementation", "sdpa")
+                    try:
+                        setattr(self.gpt.gpt.config, "attn_implementation", "sdpa")
+                    except Exception:
+                        pass
+                    print(">> GPT attention implementation set to: sdpa")
+            except Exception as e:
+                print(f">> Failed to enable SDPA attention; continue with default. Error: {e}")
+
+        # Optionally compile GPT inference model (PyTorch 2.8+). Safe fallback on failure.
+        if compile_gpt:
+            compiled = False
+            try:
+                if hasattr(torch, "compile"):
+                    # Prefer max-autotune for compute-heavy forward; generate will call forward repeatedly.
+                    self.gpt.inference_model = torch.compile(self.gpt.inference_model, mode="max-autotune")
+                    compiled = True
+                else:
+                    print(">> torch.compile not available in this PyTorch version; skip compiling GPT.")
+            except Exception as e:
+                print(f">> torch.compile for GPT failed; falling back to eager. Error: {e}")
+            if compiled:
+                print(">> GPT inference model compiled with torch.compile (mode=max-autotune)")
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
