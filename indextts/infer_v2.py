@@ -38,7 +38,7 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False
+            use_cuda_kernel=None, use_deepspeed=False, use_sdpa=False
     ):
         """
         Args:
@@ -48,6 +48,7 @@ class IndexTTS2:
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
             use_deepspeed (bool): whether to use DeepSpeed or not.
+            use_sdpa (bool): whether to use SDPA attention for GPT2 if supported.
         """
         if device is not None:
             self.device = device
@@ -96,6 +97,10 @@ class IndexTTS2:
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
 
         self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_fp16)
+
+        # Enable SDPA attention if requested and supported
+        if use_sdpa:
+            self._enable_sdpa()
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -291,6 +296,21 @@ class IndexTTS2:
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
+
+    def _enable_sdpa(self):
+        """Enable SDPA attention for GPT2 if supported"""
+        try:
+            if hasattr(self.gpt, 'gpt') and hasattr(self.gpt.gpt, 'config'):
+                # Check if SDPA is available
+                if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+                    self.gpt.gpt.config._attn_implementation = "sdpa"
+                    print(">> SDPA attention enabled for GPT2")
+                else:
+                    print(">> SDPA not available, using default attention")
+            else:
+                print(">> GPT2 config not found, using default attention")
+        except Exception as e:
+            print(f">> Failed to enable SDPA, using default attention: {e}")
 
     def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
         if not sr:
